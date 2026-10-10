@@ -1,194 +1,100 @@
-// Netlify Function для отправки анонимных сообщений в Telegram
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+// Netlify Function: forwards contact-form messages to Telegram.
+// Env vars (set in the Netlify dashboard — never commit them):
+//   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+//
+// Accepts JSON:
+//   { name, email, subject?, message, website? }   <- contact form (website = honeypot)
+//   { text, mood? }                                 <- legacy anonymous message (still supported)
+//
+// Responds { success: true } ONLY after Telegram has accepted the message.
 
-exports.handler = async function(event, context) {
-  // Проверяем метод запроса
-  if (event.httpMethod !== 'POST') {
-    return {
-      statusCode: 405,
-      body: JSON.stringify({ 
-        error: 'Method not allowed',
-        details: 'Only POST requests are accepted' 
-      })
-    };
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const MAX_BODY_BYTES = 8000;
+
+const json = (statusCode, payload, extra = {}) => ({
+  statusCode,
+  headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+  body: JSON.stringify(payload),
+});
+
+// Telegram HTML parse mode: only these three characters need escaping.
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const clip = (s, n) => String(s == null ? '' : s).trim().slice(0, n);
+
+exports.handler = async function (event) {
+  // Read env at call time (keeps the function testable and picks up dashboard changes).
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+  if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed.' }, { Allow: 'POST' });
+
+  if (!TOKEN || !CHAT_ID) {
+    // Details stay in the server log; visitors get a generic message.
+    console.error('send-message: TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not configured.');
+    return json(503, { error: 'Messaging is temporarily unavailable.' });
   }
-  
-  // Проверяем, указаны ли токен и chat_id
-  if (!TELEGRAM_BOT_TOKEN) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: 'Bot token not configured',
-        details: 'Please set TELEGRAM_BOT_TOKEN environment variable in Netlify' 
-      })
-    };
+
+  if (!event.body || Buffer.byteLength(event.body, 'utf8') > MAX_BODY_BYTES) {
+    return json(413, { error: 'The request is empty or too large.' });
   }
-  
-  if (!TELEGRAM_CHAT_ID) {
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: 'Chat ID not configured',
-        details: 'Please set TELEGRAM_CHAT_ID environment variable in Netlify' 
-      })
-    };
+
+  let data;
+  try { data = JSON.parse(event.body); } catch (_) { return json(400, { error: 'Invalid request.' }); }
+  if (!data || typeof data !== 'object') return json(400, { error: 'Invalid request.' });
+
+  // Honeypot: real visitors never see or fill this field. Pretend success, send nothing.
+  if (data.website) return json(200, { success: true });
+
+  const isLegacy = typeof data.text === 'string' && data.message === undefined;
+  const message = clip(isLegacy ? data.text : data.message, 1200);
+  const name = clip(data.name, 80);
+  const email = clip(data.email, 120);
+  const subject = clip(data.subject, 120);
+  const mood = clip(data.mood, 20);
+
+  if (!isLegacy) {
+    if (!name) return json(400, { error: 'Please tell me your name.', field: 'name' });
+    if (!EMAIL_RE.test(email)) return json(400, { error: 'Please enter a valid email address.', field: 'email' });
   }
-  
+  if (message.length < 10) return json(400, { error: 'Please write at least 10 characters.', field: 'message' });
+  if (message.length > 1000) return json(400, { error: 'Please keep the message under 1000 characters.', field: 'message' });
+
+  const headers = event.headers || {};
+  const ip = headers['x-nf-client-connection-ip'] || headers['client-ip'] || (headers['x-forwarded-for'] || '').split(',')[0] || 'unknown';
+  const ua = clip(headers['user-agent'] || 'unknown', 90);
+  const time = new Date().toLocaleString('ru-RU', { timeZone: 'Asia/Tashkent', hour12: false });
+
+  const lines = isLegacy
+    ? ['<b>Anonymous message</b>', '', esc(message), '', `Mood: ${esc(mood || 'n/a')}`]
+    : [
+        '<b>New message from the portfolio</b>', '',
+        `<b>From:</b> ${esc(name)}`,
+        `<b>Email:</b> ${esc(email)}`,
+        subject ? `<b>Subject:</b> ${esc(subject)}` : null,
+        '', esc(message),
+      ].filter((l) => l !== null);
+  lines.push('', `<i>${esc(time)} · ${esc(ip)} · ${esc(ua)}</i>`);
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
-    // Парсим тело запроса
-    let data;
-    try {
-      data = JSON.parse(event.body);
-    } catch (parseError) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ 
-          error: 'Invalid JSON in request body' 
-        })
-      };
-    }
-    
-    const { text, mood } = data;
-    
-    // Проверяем наличие обязательных полей
-    if (!text) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ 
-          error: 'Message text is required' 
-        })
-      };
-    }
-    
-    // Проверяем длину сообщения
-    const trimmedText = text.trim();
-    if (trimmedText.length < 10) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ 
-          error: 'Message is too short',
-          details: 'Message must be at least 10 characters long' 
-        })
-      };
-    }
-    
-    if (trimmedText.length > 1000) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ 
-          error: 'Message is too long',
-          details: 'Message must be no more than 1000 characters' 
-        })
-      };
-    }
-    
-    // Защита от спама (дополнительная проверка)
-    const userIP = event.headers['client-ip'] || event.headers['x-forwarded-for'] || 'unknown';
-    const userAgent = event.headers['user-agent'] || 'unknown';
-    
-    // Создаем текст сообщения для Telegram
-    const moodEmojis = {
-      neutral: '😐',
-      positive: '😊',
-      question: '❓',
-      feedback: '💬'
-    };
-    
-    const emoji = moodEmojis[mood] || '📨';
-    const timestamp = new Date().toLocaleString('ru-RU', {
-      timeZone: 'Europe/Moscow',
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-    
-    const message = `
-${emoji} *НОВОЕ АНОНИМНОЕ СООБЩЕНИЕ*
-
-💬 *Текст:*
-${trimmedText}
-
-📊 *Настроение:* ${mood || 'не указано'}
-⏰ *Время:* ${timestamp}
-🌐 *IP:* ${userIP}
-📱 *Браузер:* ${userAgent.substring(0, 50)}${userAgent.length > 50 ? '...' : ''}
-
-_Отправлено через личный сайт_
-    `;
-    
-    // Отправляем сообщение в Telegram
-    const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    
-    const telegramResponse = await fetch(telegramApiUrl, {
+    const res = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: CHAT_ID, text: lines.join('\n'), parse_mode: 'HTML', disable_web_page_preview: true }),
+      signal: ctrl.signal,
     });
-    
-    const telegramData = await telegramResponse.json();
-    
-    if (!telegramData.ok) {
-      console.error('Telegram API error:', telegramData);
-      
-      // Детализация ошибок от Telegram
-      let errorDetails = telegramData.description || 'Unknown Telegram API error';
-      
-      // Пользовательские сообщения об ошибках
-      if (errorDetails.includes('chat not found')) {
-        errorDetails = 'Chat ID указан неверно. Проверьте TELEGRAM_CHAT_ID';
-      } else if (errorDetails.includes('bot token') || errorDetails.includes('Not Found')) {
-        errorDetails = 'Токен бота указан неверно. Проверьте TELEGRAM_BOT_TOKEN';
-      } else if (errorDetails.includes('Too Many Requests')) {
-        errorDetails = 'Слишком много запросов. Подождите немного';
-      }
-      
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ 
-          error: 'Failed to send to Telegram',
-          details: errorDetails
-        })
-      };
+    const result = await res.json().catch(() => ({}));
+
+    if (!res.ok || !result.ok) {
+      console.error('send-message: Telegram rejected the message:', res.status, result && result.description);
+      return json(502, { error: 'The message could not be delivered right now.' });
     }
-    
-    // Логируем успешную отправку (без конфиденциальных данных)
-    console.log(`Message sent successfully to Telegram. Message ID: ${telegramData.result.message_id}`);
-    
-    // Возвращаем успешный ответ
-    return {
-      statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-store'
-      },
-      body: JSON.stringify({ 
-        success: true, 
-        message: 'Сообщение успешно отправлено!',
-        telegramMessageId: telegramData.result.message_id
-      })
-    };
-    
-  } catch (error) {
-    console.error('Unexpected error in send-message function:', error);
-    
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ 
-        error: 'Internal server error',
-        details: error.message,
-        note: 'Check function logs for more information'
-      })
-    };
+    return json(200, { success: true });
+  } catch (err) {
+    console.error('send-message: delivery failed:', err && err.name, err && err.message);
+    return json(502, { error: 'The message could not be delivered right now.' });
+  } finally {
+    clearTimeout(timer);
   }
 };
